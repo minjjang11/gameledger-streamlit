@@ -24,6 +24,10 @@ def generate_secret_code() -> str:
     return f"{secrets.randbelow(9000) + 1000}"
 
 
+def generate_match_id() -> str:
+    return secrets.token_hex(4).upper()
+
+
 def payoff(choice1: str, choice2: str) -> Tuple[int, int]:
     matrix = {
         ("Cooperate", "Cooperate"): (3, 3),
@@ -51,7 +55,6 @@ def init_db():
             address TEXT PRIMARY KEY,
             username TEXT NOT NULL,
             secret_code TEXT,
-            points INTEGER NOT NULL DEFAULT 0,
             games_played INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )
@@ -66,6 +69,21 @@ def init_db():
             data_json TEXT NOT NULL,
             previous_hash TEXT NOT NULL,
             hash TEXT NOT NULL
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id TEXT PRIMARY KEY,
+            player1_address TEXT NOT NULL,
+            player2_address TEXT NOT NULL,
+            choice1 TEXT,
+            choice2 TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            resolved_at TEXT
         )
         """
     )
@@ -213,7 +231,7 @@ def create_participant(username: str, create_secret: bool) -> Tuple[str, Optiona
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO participants (address, username, secret_code, points, games_played, created_at) VALUES (?, ?, ?, 0, 0, ?)",
+        "INSERT INTO participants (address, username, secret_code, games_played, created_at) VALUES (?, ?, ?, 0, ?)",
         (address, username.strip(), secret_code, created_at),
     )
     conn.commit()
@@ -310,6 +328,130 @@ def compute_participant_stats(address: str) -> Dict:
 
 
 # -----------------------------
+# Match helpers
+# -----------------------------
+def create_match(player1_address: str, player2_address: str) -> str:
+    match_id = generate_match_id()
+    created_at = datetime.utcnow().isoformat()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO matches (match_id, player1_address, player2_address, choice1, choice2, status, created_at, resolved_at) VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL)",
+        (match_id, player1_address, player2_address, "pending", created_at),
+    )
+    conn.commit()
+    conn.close()
+    return match_id
+
+
+def fetch_matches() -> List[Dict]:
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM matches ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_match(match_id: str) -> Optional[Dict]:
+    conn = get_conn()
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM matches WHERE match_id = ?", (match_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def resolve_match_if_ready(match_id: str):
+    match = get_match(match_id)
+    if not match:
+        return None
+    if not match["choice1"] or not match["choice2"] or match["status"] == "resolved":
+        return None
+
+    participant_map = get_participant_map()
+    player1 = match["player1_address"]
+    player2 = match["player2_address"]
+    choice1 = match["choice1"]
+    choice2 = match["choice2"]
+    payoff1, payoff2 = payoff(choice1, choice2)
+
+    if payoff1 > payoff2:
+        winner = player1
+    elif payoff2 > payoff1:
+        winner = player2
+    else:
+        winner = None
+
+    result_data = {
+        "game": "PrisonersDilemma",
+        "match_id": match_id,
+        "player1_username": participant_map[player1]["username"],
+        "player1_address": player1,
+        "player2_username": participant_map[player2]["username"],
+        "player2_address": player2,
+        "choice1": choice1,
+        "choice2": choice2,
+        "payoff1": payoff1,
+        "payoff2": payoff2,
+        "winner": winner if winner else "Draw",
+    }
+
+    result_hash = sha256_text(json.dumps(result_data, sort_keys=True))
+    result_data["result_hash"] = result_hash
+    add_block(result_data)
+    update_games_played(player1, player2)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE matches SET status = ?, resolved_at = ? WHERE match_id = ?",
+        ("resolved", datetime.utcnow().isoformat(), match_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return result_data
+
+
+def submit_choice(match_id: str, player_address: str, choice: str) -> Tuple[bool, str]:
+    match = get_match(match_id)
+    if not match:
+        return False, "Match not found."
+    if match["status"] == "resolved":
+        return False, "This match has already been resolved."
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if player_address == match["player1_address"]:
+        if match["choice1"]:
+            conn.close()
+            return False, "Player 1 has already submitted a choice."
+        cur.execute("UPDATE matches SET choice1 = ? WHERE match_id = ?", (choice, match_id))
+    elif player_address == match["player2_address"]:
+        if match["choice2"]:
+            conn.close()
+            return False, "Player 2 has already submitted a choice."
+        cur.execute("UPDATE matches SET choice2 = ? WHERE match_id = ?", (choice, match_id))
+    else:
+        conn.close()
+        return False, "This address is not part of the selected match."
+
+    conn.commit()
+    conn.close()
+
+    resolved_data = resolve_match_if_ready(match_id)
+    if resolved_data:
+        return True, "Choice submitted. Both players have now submitted, so the match was resolved and recorded on the chain."
+
+    return True, "Choice submitted. Waiting for the other player's decision."
+
+
+# -----------------------------
 # App start
 # -----------------------------
 init_db()
@@ -323,6 +465,10 @@ with st.expander("Project summary", expanded=False):
         "This demo lets users play Prisoner's Dilemma, stores each game outcome as a block record, "
         "and validates whether the stored chain has been altered afterwards."
     )
+
+participants = fetch_participants()
+participant_map = get_participant_map()
+participant_addresses = [p["address"] for p in participants]
 
 # -----------------------------
 # 1. Participant registration
@@ -347,6 +493,7 @@ if submitted:
 
 participants = fetch_participants()
 participant_map = get_participant_map()
+participant_addresses = [p["address"] for p in participants]
 
 if participants:
     st.subheader("Current participants")
@@ -371,64 +518,77 @@ if participants:
 
 
 # -----------------------------
-# 2. Play the game
+# 2. Create a match
 # -----------------------------
-st.header("2) Play Prisoner's Dilemma")
-participant_addresses = [p["address"] for p in participants]
-
+st.header("2) Create a match")
 if len(participant_addresses) < 2:
-    st.warning("Create at least two participants before starting a game.")
+    st.warning("Create at least two participants before creating a match.")
 else:
-    with st.form("game_form"):
-        player1 = st.selectbox("Player 1 address", participant_addresses, index=0)
-        player2_options = [p for p in participant_addresses if p != player1]
-        player2 = st.selectbox("Player 2 address", player2_options, index=0)
+    with st.form("match_form"):
+        match_player1 = st.selectbox("Player 1 address", participant_addresses, key="match_p1")
+        match_player2_options = [p for p in participant_addresses if p != match_player1]
+        match_player2 = st.selectbox("Player 2 address", match_player2_options, key="match_p2")
+        submitted_match = st.form_submit_button("Create match")
 
-        choice1 = st.selectbox("Player 1 choice", ["Cooperate", "Defect"])
-        choice2 = st.selectbox("Player 2 choice", ["Cooperate", "Defect"])
+    if submitted_match:
+        match_id = create_match(match_player1, match_player2)
+        st.success("Match created.")
+        st.write(f"**Match ID:** `{match_id}`")
+        st.info("Share this Match ID with both players. Each player should submit their choice from their own device.")
 
-        submitted_game = st.form_submit_button("Submit game result")
 
-    if submitted_game:
-        payoff1, payoff2 = payoff(choice1, choice2)
+# -----------------------------
+# 3. Submit a private choice
+# -----------------------------
+st.header("3) Submit a private choice")
+if not participant_addresses:
+    st.info("No participants yet.")
+else:
+    with st.form("submit_choice_form"):
+        submit_address = st.selectbox("Your address", participant_addresses, key="submit_addr")
+        submit_match_id = st.text_input("Match ID").strip().upper()
+        submit_choice_value = st.radio("Your choice", ["Cooperate", "Defect"], horizontal=True)
+        submit_choice_btn = st.form_submit_button("Submit my private choice")
 
-        winner: Optional[str]
-        if payoff1 > payoff2:
-            winner = player1
-        elif payoff2 > payoff1:
-            winner = player2
+    if submit_choice_btn:
+        if not submit_match_id:
+            st.error("Please enter a Match ID.")
         else:
-            winner = None
-
-        result_data = {
-            "game": "PrisonersDilemma",
-            "player1_username": participant_map[player1]["username"],
-            "player1_address": player1,
-            "player2_username": participant_map[player2]["username"],
-            "player2_address": player2,
-            "choice1": choice1,
-            "choice2": choice2,
-            "payoff1": payoff1,
-            "payoff2": payoff2,            "winner": winner if winner else "Draw",
-        }
-
-        result_hash = sha256_text(json.dumps(result_data, sort_keys=True))
-        result_data["result_hash"] = result_hash
-
-        add_block(result_data)
-        update_games_played(player1, player2)
-
-        st.success("Game recorded as a blockchain-style block.")
-        st.write(f"**Result:** {choice1} vs {choice2}")
-        st.write(f"**Payoffs:** {payoff1} / {payoff2}")
-        st.write(f"**Winner:** {winner if winner else 'Draw'}")
-        st.code(result_hash, language="text")
+            ok, message = submit_choice(submit_match_id, submit_address, submit_choice_value)
+            if ok:
+                st.success(message)
+            else:
+                st.error(message)
 
 
 # -----------------------------
-# 3. Validate chain
+# 4. Match status and results
 # -----------------------------
-st.header("3) Validate chain")
+st.header("4) Match status")
+matches = fetch_matches()
+if not matches:
+    st.info("No matches yet.")
+else:
+    match_rows = []
+    for m in matches:
+        match_rows.append(
+            {
+                "match_id": m["match_id"],
+                "player1_address": m["player1_address"],
+                "player2_address": m["player2_address"],
+                "choice1_submitted": bool(m["choice1"]),
+                "choice2_submitted": bool(m["choice2"]),
+                "status": m["status"],
+            }
+        )
+    st.dataframe(match_rows, use_container_width=True)
+    st.caption("Choices remain hidden until both players have submitted.")
+
+
+# -----------------------------
+# 5. Validate chain
+# -----------------------------
+st.header("5) Validate chain")
 if st.button("Validate blockchain"):
     valid, message = is_chain_valid()
     if valid:
@@ -438,15 +598,15 @@ if st.button("Validate blockchain"):
 
 
 # -----------------------------
-# 4. Tampering demo
+# 6. Tampering demo
 # -----------------------------
-st.header("4) Tampering demo")
+st.header("6) Tampering demo")
 st.write("Change a stored value to demonstrate why validation matters.")
 
 blocks = fetch_blocks()
 chain_length = len(blocks)
 if chain_length <= 1:
-    st.info("Play at least one game first.")
+    st.info("Resolve at least one match first.")
 else:
     editable_indices = [b["index"] for b in blocks[1:]]
     selected_block = st.selectbox("Choose block to tamper with", editable_indices)
@@ -464,9 +624,9 @@ else:
 
 
 # -----------------------------
-# 5. Blockchain records
+# 7. Blockchain records
 # -----------------------------
-st.header("5) Blockchain records")
+st.header("7) Blockchain records")
 blocks = fetch_blocks()
 for block in blocks:
     with st.expander(f"Block {block['index']}", expanded=(block["index"] == len(blocks) - 1)):
@@ -474,9 +634,9 @@ for block in blocks:
 
 
 # -----------------------------
-# 6. Participant history
+# 8. Participant history
 # -----------------------------
-st.header("6) Participant history")
+st.header("8) Participant history")
 if not participant_addresses:
     st.info("No participants yet.")
 else:
@@ -494,7 +654,7 @@ else:
     })
     history = fetch_history_for_address(selected_history_address)
     if not history:
-        st.info("This participant has no games yet.")
+        st.info("This participant has no resolved games yet.")
     else:
         st.write(f"Showing {len(history)} recorded game(s) for `{selected_history_address}`")
         for block in history:
@@ -503,9 +663,9 @@ else:
 
 
 # -----------------------------
-# 7. Solidity extension placeholder
+# 9. Solidity extension placeholder
 # -----------------------------
-st.header("7) Solidity extension")
+st.header("9) Solidity extension")
 latest_hash = blocks[-1]["data"].get("result_hash") if len(blocks) > 1 else None
 st.write(
     "Next step: store the latest result hash in a tiny Solidity smart contract, "
@@ -516,4 +676,5 @@ if latest_hash:
     st.write("Latest result hash to anchor in Solidity:")
     st.code(latest_hash, language="text")
 else:
-    st.info("No result hash yet. Play a game first.")
+    st.info("No result hash yet. Resolve a match first.")
+
